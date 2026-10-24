@@ -50,6 +50,10 @@ std::string model_name_of(const std::string& path) {
     return b.empty() ? std::string("unbiased-strata") : b;
 }
 
+// What closes the thinking when it reaches its budget: a short wrap-up and the model's own end-of-thinking tag, after
+// which the answer is generated (the Python server's #123 wrap-up, carried over).
+const char* const REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n";
+
 struct Options {
     std::string model;                  // shard 1 of the GGUF
     std::string pack;                   // the prepared pack directory
@@ -62,6 +66,7 @@ struct Options {
     int threads = 0;                    // CPU expert workers; 0 = the engine's default (every physical core)
     long long vram_cap_mib = 0;         // --vram-cap: the engine limits itself to a smaller card's VRAM
     double ram_cap_gib = 0.0;           // --ram-cap: bounds the engine's RAM expert tier and pinned arena
+    long long reasoning_budget = 0;     // --reasoning-budget: thinking cap for requests that set none (0: none)
     std::vector<std::string> extra;     // after `--`: passed to the engine as they are
 };
 
@@ -79,7 +84,9 @@ void usage() {
         "  --host ADDR     address to listen on (default 127.0.0.1)\n"
         "  --port N        port to listen on (default 8080)\n"
         "  --vram-cap MIB  emulate a smaller card: the engine uses at most MIB of VRAM (a 1080 Ti as 6 GB: 5722)\n"
-        "  --ram-cap GIB   bound the engine's RAM expert tier and pinned arena to GIB\n\n"
+        "  --ram-cap GIB   bound the engine's RAM expert tier and pinned arena to GIB\n"
+        "  --reasoning-budget N  cap the thinking at N tokens for requests that set no budget (0: no cap); a request\n"
+        "                  sets its own with reasoning_budget_tokens or thinking_token_budget\n\n"
         "Serves POST /v1/chat/completions (OpenAI style, with streaming), GET /v1/models and GET /health (with the\n"
         "engine's expert tiers and per-token counters: VRAM slots, RAM copies, mapped experts, hits, warm hints,\n"
         "major page faults).\n");
@@ -140,10 +147,13 @@ struct Prepared {
     std::shared_ptr<strata_frontend::ImageFile> images;
     std::vector<llama_token> ids;
     std::string header;        // "GEN <max_new> key=value ... " - the ids follow
+    std::string header_rest;   // the header after max_new: a thinking-budget continuation reuses it with a new max_new
     std::string request_id;
     common_chat_parser_params parser;   // how to split the output into reasoning, answer and tool calls
     bool stream = false;
     long long max_new = 0;
+    bool thinking = false;             // the template opens a thinking block for this request
+    long long reasoning_budget = 0;    // tokens the thinking may take before it is wrapped up (0: no cap)
 };
 
 /// The parse of one response as its text grows: what has been published, and what to publish next.
@@ -257,6 +267,7 @@ struct Server {
             if (kw.contains("preserve_thinking") && kw.at("preserve_thinking").is_boolean())
                 in.chat_template_kwargs["preserve_thinking"] = kw.at("preserve_thinking").dump();
         }
+        p.thinking = in.enable_thinking;
         const common_chat_params cp = common_chat_templates_apply(tmpls.get(), in);
         std::string rendered = cp.prompt;
         if (images.empty()) {
@@ -346,8 +357,18 @@ struct Server {
                 keys += b;
                 if (keys.find("penalty_last_n") == std::string::npos) keys += " penalty_last_n=64";
             }
-        p.header = (p.images ? "GENI " : "GEN ") + std::to_string(max_new) + keys + " " +
-                   (p.images ? p.images->path + " " : "");
+        // The thinking budget: the request's reasoning_budget_tokens, else pi's thinking_token_budget, else
+        // --reasoning-budget; 0 means no cap.  An image request is not capped: its continuation would have to carry
+        // the image again, and it is not wired for that.
+        p.reasoning_budget = opt.reasoning_budget;
+        for (const char* key : {"reasoning_budget_tokens", "thinking_token_budget"})
+            if (body.contains(key) && body.at(key).is_number()) {
+                p.reasoning_budget = std::max(0LL, body.at(key).get<long long>());
+                break;
+            }
+        if (p.images) p.reasoning_budget = 0;
+        p.header_rest = keys + " " + (p.images ? p.images->path + " " : "");
+        p.header = (p.images ? "GENI " : "GEN ") + std::to_string(max_new) + p.header_rest;
         // Opt-in provenance capture: the exact first rendered request this
         // process serves, including token IDs and the engine sampling header.
         if (const char* path = std::getenv("SUGMEOFF_CAPTURE_FIRST_PROMPT")) {
@@ -412,14 +433,30 @@ struct Server {
                 last_write = std::chrono::steady_clock::now();
             }
         };
-        GenResult r = engine.generate(p.header, p.ids, [&](llama_token id) {
+        // The thinking budget (Prepared::reasoning_budget): while the reasoning is open its tokens are counted.  At the
+        // budget the segment stops, the wrap-up closes the thinking, and the answer is generated from the same prefix
+        // in a new segment: the engine continues from the ids it holds, so nothing already read is read again.
+        bool reasoning_open = p.thinking && p.reasoning_budget > 0;
+        long long thought = 0;
+        bool budget_hit = false;
+        std::vector<llama_token> produced_ids;   // every token generated so far: the next segment's prefix
+        const auto on_token = [&](llama_token id) {
             if (llama_vocab_is_eog(vocab, id)) return client_ok;
+            produced_ids.push_back(id);
             pending += common_token_to_piece(vocab, id, /*special=*/true);
             const size_t n = utf8_complete_prefix(pending);
             if (n > 0) {
                 text.append(pending, 0, n);
                 pending.erase(0, n);
                 if (p.stream) update(true);                     // a whole response is parsed once, at the end
+            }
+            if (reasoning_open) {
+                ++thought;
+                if (text.find("</think>") != std::string::npos) reasoning_open = false;
+                else if (thought >= p.reasoning_budget) {
+                    budget_hit = true;
+                    return false;
+                }
             }
             if (client_ok && keepalive) {
                 const auto now = std::chrono::steady_clock::now();
@@ -429,7 +466,34 @@ struct Server {
                 }
             }
             return client_ok;
-        });
+        };
+        std::vector<llama_token> ids = p.ids;
+        std::string header = p.header;
+        GenResult r;
+        for (;;) {
+            budget_hit = false;
+            r = engine.generate(header, ids, on_token);
+            if (!budget_hit || !r.ok) break;
+            const std::vector<llama_token> wrap = common_tokenize(vocab, REASONING_WRAP_UP, false, true);
+            const long long left = p.max_new - (long long) (produced_ids.size() + wrap.size());
+            if (left < 1) {                                     // no room left to answer: "length", as without a budget
+                r.finish = "length";
+                break;
+            }
+            std::fprintf(stderr, "unbiased-strata: request %s: thinking budget of %lld tokens reached: wrapping up\n",
+                         p.request_id.c_str(), p.reasoning_budget);
+            text += pending;
+            pending.clear();
+            text += REASONING_WRAP_UP;
+            if (p.stream) update(true);
+            produced_ids.insert(produced_ids.end(), wrap.begin(), wrap.end());
+            ids = p.ids;
+            ids.insert(ids.end(), produced_ids.begin(), produced_ids.end());
+            header = "GEN " + std::to_string(left) + p.header_rest;
+            reasoning_open = false;                             // the wrap-up closed it: one budget per request
+        }
+        r.produced = (long long) produced_ids.size();
+        r.prompt_n = (long long) p.ids.size();
         text += pending;
         try {
             update(false);
@@ -626,6 +690,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--threads") o.threads = std::atoi(next("--threads").c_str());
         else if (a == "--vram-cap") o.vram_cap_mib = std::atoll(next("--vram-cap").c_str());
         else if (a == "--ram-cap") o.ram_cap_gib = std::atof(next("--ram-cap").c_str());
+        else if (a == "--reasoning-budget") o.reasoning_budget = std::atoll(next("--reasoning-budget").c_str());
         else if (a == "--") {
             for (++i; i < argc; ++i) {
                 const std::string e = argv[i];
