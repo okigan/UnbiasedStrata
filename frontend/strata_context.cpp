@@ -399,10 +399,11 @@ struct strata_context_impl {
 
     // the thinking budget for this request, when it has one (mirrors common_sampler_init's reasoning budget sampler):
     // the sampler starts from the generation prompt, so a template that opens the thinking starts it counting. A
-    // request with pictures is not budgeted: its continuation would have to carry the pictures again.
+    // request with pictures is not budgeted: its continuation would have to carry the pictures again. (With --mmproj
+    // every request's tokens are multimodal; one without pictures has no image keys and text ids, and is budgeted.)
     void arm_budget(const server_task & t) {
         const auto & s = t.params.sampling;
-        if (t.tokens.has_mtmd || s.reasoning_budget_tokens < 0 || s.reasoning_budget_start.empty() ||
+        if (!slot.image_keys.empty() || s.reasoning_budget_tokens < 0 || s.reasoning_budget_start.empty() ||
             s.reasoning_budget_end.empty()) {
             return;
         }
